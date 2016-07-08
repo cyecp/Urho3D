@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2008-2015 the Urho3D project.
+// Copyright (c) 2008-2016 the Urho3D project.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -32,12 +32,18 @@
 #include "../IO/IOEvents.h"
 #include "../IO/Log.h"
 
+#ifdef __ANDROID__
+#include <SDL/SDL_rwops.h>
+#endif
+
+#ifndef MINI_URHO
 #include <SDL/SDL_filesystem.h>
+#endif
 
 #include <sys/stat.h>
+#include <cstdio>
 
 #ifdef _WIN32
-#include <cstdio>
 #ifndef _MSC_VER
 #define _WIN32_IE 0x501
 #endif
@@ -62,7 +68,7 @@
 
 extern "C"
 {
-#ifdef ANDROID
+#ifdef __ANDROID__
 const char* SDL_Android_GetFilesDir();
 char** SDL_Android_GetFileList(const char* path, int* count);
 void SDL_Android_FreeFileList(char*** array, int* count);
@@ -79,12 +85,12 @@ namespace Urho3D
 
 int DoSystemCommand(const String& commandLine, bool redirectToLog, Context* context)
 {
-#if !defined(NO_POPEN)
+#if !defined(NO_POPEN) && !defined(MINI_URHO)
     if (!redirectToLog)
 #endif
         return system(commandLine.CString());
 
-#if !defined(NO_POPEN)
+#if !defined(NO_POPEN) && !defined(MINI_URHO)
     // Get a platform-agnostic temporary file name for stderr redirection
     String stderrFilename;
     String adjustedCommandLine(commandLine);
@@ -584,7 +590,7 @@ bool FileSystem::FileExists(const String& fileName) const
     if (!CheckAccess(GetPath(fileName)))
         return false;
 
-#ifdef ANDROID
+#ifdef __ANDROID__
     if (URHO3D_IS_ASSET(fileName))
     {
         SDL_RWops* rwOps = SDL_RWFromFile(URHO3D_ASSET(fileName), "rb");
@@ -626,7 +632,7 @@ bool FileSystem::DirExists(const String& pathName) const
 
     String fixedName = GetNativePath(RemoveTrailingSlash(pathName));
 
-#ifdef ANDROID
+#ifdef __ANDROID__
     if (URHO3D_IS_ASSET(fixedName))
     {
         // Split the pathname into two components: the longest parent directory path and the last name component
@@ -684,7 +690,7 @@ String FileSystem::GetProgramDir() const
     if (!programDir_.Empty())
         return programDir_;
 
-#if defined(ANDROID)
+#if defined(__ANDROID__)
     // This is an internal directory specifier pointing to the assets in the .apk
     // Files from this directory will be opened using special handling
     programDir_ = APK;
@@ -728,7 +734,7 @@ String FileSystem::GetProgramDir() const
 
 String FileSystem::GetUserDocumentsDir() const
 {
-#if defined(ANDROID)
+#if defined(__ANDROID__)
     return AddTrailingSlash(SDL_Android_GetFilesDir());
 #elif defined(IOS)
     return AddTrailingSlash(SDL_IOS_GetDocumentsDir());
@@ -748,6 +754,7 @@ String FileSystem::GetUserDocumentsDir() const
 String FileSystem::GetAppPreferencesDir(const String& org, const String& app) const
 {
     String dir;
+#ifndef MINI_URHO
     char* prefPath = SDL_GetPrefPath(org.CString(), app.CString());
     if (prefPath)
     {
@@ -755,6 +762,7 @@ String FileSystem::GetAppPreferencesDir(const String& org, const String& app) co
         SDL_free(prefPath);
     }
     else
+#endif
         URHO3D_LOGWARNING("Could not get application preferences directory");
 
     return dir;
@@ -804,7 +812,7 @@ void FileSystem::ScanDirInternal(Vector<String>& result, String path, const Stri
     if (filterExtension.Contains('*'))
         filterExtension.Clear();
 
-#ifdef ANDROID
+#ifdef __ANDROID__
     if (URHO3D_IS_ASSET(path))
     {
         String assetPath(URHO3D_ASSET(path));

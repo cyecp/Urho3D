@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2008-2015 the Urho3D project.
+// Copyright (c) 2008-2016 the Urho3D project.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -39,18 +39,39 @@
 namespace Urho3D
 {
 
-ShaderVariation::ShaderVariation(Shader* owner, ShaderType type) :
-    GPUObject(owner->GetSubsystem<Graphics>()),
-    owner_(owner),
-    type_(type)
+void CopyStrippedCode(PODVector<unsigned char>& byteCode, unsigned char* bufData, unsigned bufSize)
 {
-    for (unsigned i = 0; i < MAX_TEXTURE_UNITS; ++i)
-        useTextureUnit_[i] = false;
+    unsigned const D3DSIO_COMMENT = 0xFFFE;
+    unsigned* srcWords = (unsigned*)bufData;
+    unsigned srcWordSize = bufSize >> 2;
+    byteCode.Clear();
+
+    for (unsigned i = 0; i < srcWordSize; ++i)
+    {
+        unsigned opcode = srcWords[i] & 0xffff;
+        // unsigned paramLength = (srcWords[i] & 0x0f000000) >> 24;
+        unsigned commentLength = srcWords[i] >> 16;
+
+        // For now, skip comment only at fixed position to prevent false positives
+        if (i == 1 && opcode == D3DSIO_COMMENT)
+        {
+            // Skip the comment
+            i += commentLength;
+        }
+        else
+        {
+            // Not a comment, copy the data
+            unsigned destPos = byteCode.Size();
+            byteCode.Resize(destPos + sizeof(unsigned));
+            unsigned* dest = (unsigned*)&byteCode[destPos];
+            *dest = srcWords[i];
+        }
+    }
 }
 
-ShaderVariation::~ShaderVariation()
+void ShaderVariation::OnDeviceLost()
 {
-    Release();
+    // No-op on Direct3D9, shaders are preserved through a device loss & reset
 }
 
 bool ShaderVariation::Create()
@@ -72,64 +93,68 @@ bool ShaderVariation::Create()
     extension = type_ == VS ? ".vs3" : ".ps3";
 
     String binaryShaderName = path + "Cache/" + name + "_" + StringHash(defines_).ToString() + extension;
-    PODVector<unsigned> byteCode;
 
-    if (!LoadByteCode(byteCode, binaryShaderName))
+    if (!LoadByteCode(binaryShaderName))
     {
         // Compile shader if don't have valid bytecode
-        if (!Compile(byteCode))
+        if (!Compile())
             return false;
         // Save the bytecode after successful compile, but not if the source is from a package
         if (owner_->GetTimeStamp())
-            SaveByteCode(byteCode, binaryShaderName);
+            SaveByteCode(binaryShaderName);
     }
 
     // Then create shader from the bytecode
     IDirect3DDevice9* device = graphics_->GetImpl()->GetDevice();
     if (type_ == VS)
     {
-        if (!device || FAILED(device->CreateVertexShader(
-            (const DWORD*)&byteCode[0],
-            (IDirect3DVertexShader9**)&object_)))
-            compilerOutput_ = "Could not create vertex shader";
+        HRESULT hr = device->CreateVertexShader(
+            (const DWORD*)&byteCode_[0],
+            (IDirect3DVertexShader9**)&object_.ptr_);
+        if (FAILED(hr))
+        {
+            URHO3D_SAFE_RELEASE(object_.ptr_);
+            compilerOutput_ = "Could not create vertex shader (HRESULT " + ToStringHex((unsigned)hr) + ")";
+        }
     }
     else
     {
-        if (!device || FAILED(device->CreatePixelShader(
-            (const DWORD*)&byteCode[0],
-            (IDirect3DPixelShader9**)&object_)))
-            compilerOutput_ = "Could not create pixel shader";
+        HRESULT hr = device->CreatePixelShader(
+            (const DWORD*)&byteCode_[0],
+            (IDirect3DPixelShader9**)&object_.ptr_);
+        if (FAILED(hr))
+        {
+            URHO3D_SAFE_RELEASE(object_.ptr_);
+            compilerOutput_ = "Could not create pixel shader (HRESULT " + ToStringHex((unsigned)hr) + ")";
+        }
     }
 
-    return object_ != 0;
+    // The bytecode is not needed on Direct3D9 after creation, so delete it to save memory
+    byteCode_.Clear();
+    byteCode_.Reserve(0);
+
+    return object_.ptr_ != 0;
 }
 
 void ShaderVariation::Release()
 {
-    if (object_)
+    if (object_.ptr_ && graphics_)
     {
-        if (!graphics_)
-            return;
-
         graphics_->CleanupShaderPrograms(this);
 
         if (type_ == VS)
         {
             if (graphics_->GetVertexShader() == this)
                 graphics_->SetShaders(0, 0);
-
-            ((IDirect3DVertexShader9*)object_)->Release();
         }
         else
         {
             if (graphics_->GetPixelShader() == this)
                 graphics_->SetShaders(0, 0);
-
-            ((IDirect3DPixelShader9*)object_)->Release();
         }
-
-        object_ = 0;
     }
+
+    URHO3D_SAFE_RELEASE(object_.ptr_);
 
     compilerOutput_.Clear();
 
@@ -138,22 +163,12 @@ void ShaderVariation::Release()
     parameters_.Clear();
 }
 
-void ShaderVariation::SetName(const String& name)
-{
-    name_ = name;
-}
-
 void ShaderVariation::SetDefines(const String& defines)
 {
     defines_ = defines;
 }
 
-Shader* ShaderVariation::GetOwner() const
-{
-    return owner_;
-}
-
-bool ShaderVariation::LoadByteCode(PODVector<unsigned>& byteCode, const String& binaryShaderName)
+bool ShaderVariation::LoadByteCode(const String& binaryShaderName)
 {
     ResourceCache* cache = owner_->GetSubsystem<ResourceCache>();
     if (!cache->Exists(binaryShaderName))
@@ -184,7 +199,11 @@ bool ShaderVariation::LoadByteCode(PODVector<unsigned>& byteCode, const String& 
         unsigned reg = file->ReadUByte();
         unsigned regCount = file->ReadUByte();
 
-        ShaderParameter parameter(type_, name, reg, regCount);
+        ShaderParameter parameter;
+        parameter.type_ = type_;
+        parameter.name_ = name;
+        parameter.register_ = reg;
+        parameter.regCount_ = regCount;
         parameters_[StringHash(name)] = parameter;
     }
 
@@ -201,8 +220,8 @@ bool ShaderVariation::LoadByteCode(PODVector<unsigned>& byteCode, const String& 
     unsigned byteCodeSize = file->ReadUInt();
     if (byteCodeSize)
     {
-        byteCode.Resize(byteCodeSize >> 2);
-        file->Read(&byteCode[0], byteCodeSize);
+        byteCode_.Resize(byteCodeSize);
+        file->Read(&byteCode_[0], byteCodeSize);
 
         if (type_ == VS)
             URHO3D_LOGDEBUG("Loaded cached vertex shader " + GetFullName());
@@ -218,7 +237,7 @@ bool ShaderVariation::LoadByteCode(PODVector<unsigned>& byteCode, const String& 
     }
 }
 
-bool ShaderVariation::Compile(PODVector<unsigned>& byteCode)
+bool ShaderVariation::Compile()
 {
     const String& sourceCode = owner_->GetSourceCode(type_);
     Vector<String> defines = defines_.Split(' ');
@@ -279,13 +298,16 @@ bool ShaderVariation::Compile(PODVector<unsigned>& byteCode)
     macros.Push(endMacro);
 
     // Compile using D3DCompile
+    ID3DBlob* shaderCode = 0;
+    ID3DBlob* errorMsgs = 0;
 
-    LPD3DBLOB shaderCode = 0;
-    LPD3DBLOB errorMsgs = 0;
-
-    if (FAILED(D3DCompile(sourceCode.CString(), sourceCode.Length(), owner_->GetName().CString(), &macros.Front(), 0,
-        entryPoint, profile, flags, 0, &shaderCode, &errorMsgs)))
-        compilerOutput_ = String((const char*)errorMsgs->GetBufferPointer(), (unsigned)errorMsgs->GetBufferSize());
+    HRESULT hr = D3DCompile(sourceCode.CString(), sourceCode.Length(), owner_->GetName().CString(), &macros.Front(), 0,
+        entryPoint, profile, flags, 0, &shaderCode, &errorMsgs);
+    if (FAILED(hr))
+    {
+        // Do not include end zero unnecessarily
+        compilerOutput_ = String((const char*)errorMsgs->GetBufferPointer(), (unsigned)errorMsgs->GetBufferSize() - 1);
+    }
     else
     {
         if (type_ == VS)
@@ -297,15 +319,13 @@ bool ShaderVariation::Compile(PODVector<unsigned>& byteCode)
         unsigned char* bufData = (unsigned char*)shaderCode->GetBufferPointer();
         unsigned bufSize = (unsigned)shaderCode->GetBufferSize();
         ParseParameters(bufData, bufSize);
-        CopyStrippedCode(byteCode, bufData, bufSize);
+        CopyStrippedCode(byteCode_, bufData, bufSize);
     }
 
-    if (shaderCode)
-        shaderCode->Release();
-    if (errorMsgs)
-        errorMsgs->Release();
+    URHO3D_SAFE_RELEASE(shaderCode);
+    URHO3D_SAFE_RELEASE(errorMsgs);
 
-    return !byteCode.Empty();
+    return !byteCode_.Empty();
 }
 
 void ShaderVariation::ParseParameters(unsigned char* bufData, unsigned bufSize)
@@ -335,41 +355,19 @@ void ShaderVariation::ParseParameters(unsigned char* bufData, unsigned bufSize)
         }
         else
         {
-            ShaderParameter newParam(type_, name, reg, regCount);
-            parameters_[StringHash(name)] = newParam;
+            ShaderParameter parameter;
+            parameter.type_ = type_;
+            parameter.name_ = name;
+            parameter.register_ = reg;
+            parameter.regCount_ = regCount;
+            parameters_[StringHash(name)] = parameter;
         }
     }
 
     MOJOSHADER_freeParseData(parseData);
 }
 
-void ShaderVariation::CopyStrippedCode(PODVector<unsigned>& byteCode, unsigned char* bufData, unsigned bufSize)
-{
-    unsigned const D3DSIO_COMMENT = 0xFFFE;
-    unsigned* srcWords = (unsigned*)bufData;
-    unsigned srcWordSize = bufSize >> 2;
-
-    for (unsigned i = 0; i < srcWordSize; ++i)
-    {
-        unsigned opcode = srcWords[i] & 0xffff;
-        // unsigned paramLength = (srcWords[i] & 0x0f000000) >> 24;
-        unsigned commentLength = srcWords[i] >> 16;
-
-        // For now, skip comment only at fixed position to prevent false positives
-        if (i == 1 && opcode == D3DSIO_COMMENT)
-        {
-            // Skip the comment
-            i += commentLength;
-        }
-        else
-        {
-            // Not a comment, copy the data
-            byteCode.Push(srcWords[i]);
-        }
-    }
-}
-
-void ShaderVariation::SaveByteCode(const PODVector<unsigned>& byteCode, const String& binaryShaderName)
+void ShaderVariation::SaveByteCode(const String& binaryShaderName)
 {
     ResourceCache* cache = owner_->GetSubsystem<ResourceCache>();
     FileSystem* fileSystem = owner_->GetSubsystem<FileSystem>();
@@ -411,10 +409,10 @@ void ShaderVariation::SaveByteCode(const PODVector<unsigned>& byteCode, const St
         }
     }
 
-    unsigned dataSize = byteCode.Size() << 2;
+    unsigned dataSize = byteCode_.Size();
     file->WriteUInt(dataSize);
     if (dataSize)
-        file->Write(&byteCode[0], dataSize);
+        file->Write(&byteCode_[0], dataSize);
 }
 
 }

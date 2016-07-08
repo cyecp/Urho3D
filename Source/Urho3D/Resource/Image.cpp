@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2008-2015 the Urho3D project.
+// Copyright (c) 2008-2016 the Urho3D project.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -31,12 +31,11 @@
 
 #include <JO/jo_jpeg.h>
 #include <SDL/SDL_surface.h>
+#define STB_IMAGE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <STB/stb_image.h>
 #include <STB/stb_image_write.h>
-
 #include "../DebugNew.h"
-
-extern "C" unsigned char* stbi_write_png_to_mem(unsigned char* pixels, int stride_bytes, int x, int y, int n, int* out_len);
 
 #ifndef MAKEFOURCC
 #define MAKEFOURCC(ch0, ch1, ch2, ch3) ((unsigned)(ch0) | ((unsigned)(ch1) << 8) | ((unsigned)(ch2) << 16) | ((unsigned)(ch3) << 24))
@@ -244,9 +243,11 @@ Image::Image(Context* context) :
     height_(0),
     depth_(0),
     components_(0),
+    numCompressedLevels_(0),
     cubemap_(false),
     array_(false),
-    sRGB_(false)
+    sRGB_(false),
+    compressedFormat_(CF_NONE)
 {
 }
 
@@ -371,22 +372,22 @@ bool Image::BeginLoad(Deserializer& source)
             unsigned x = ddsd.dwWidth_ / 2;
             unsigned y = ddsd.dwHeight_ / 2;
             unsigned z = ddsd.dwDepth_ / 2;
-            for (unsigned level = ddsd.dwMipMapCount_; level > 0; x /= 2, y /= 2, z /= 2, level -= 1)
+            for (unsigned level = ddsd.dwMipMapCount_; level > 1; x /= 2, y /= 2, z /= 2, --level)
             {
-                blocksWide = (Max(x, 1) + 3) / 4;
-                blocksHeight = (Max(y, 1) + 3) / 4;
-                dataSize += blockSize * blocksWide * blocksHeight * Max(z, 1);
+                blocksWide = (Max(x, 1U) + 3) / 4;
+                blocksHeight = (Max(y, 1U) + 3) / 4;
+                dataSize += blockSize * blocksWide * blocksHeight * Max(z, 1U);
             }
         }
         else
         {
-            dataSize = (ddsd.ddpfPixelFormat_.dwRGBBitCount_ / 8) * ddsd.dwWidth_ * ddsd.dwHeight_ * Max(ddsd.dwDepth_, 1);
+            dataSize = (ddsd.ddpfPixelFormat_.dwRGBBitCount_ / 8) * ddsd.dwWidth_ * ddsd.dwHeight_ * Max(ddsd.dwDepth_, 1U);
             // Calculate mip data size
             unsigned x = ddsd.dwWidth_ / 2;
             unsigned y = ddsd.dwHeight_ / 2;
             unsigned z = ddsd.dwDepth_ / 2;
-            for (unsigned level = ddsd.dwMipMapCount_; level > 0; x /= 2, y /= 2, z /= 2, level -= 1)
-                dataSize += (ddsd.ddpfPixelFormat_.dwRGBBitCount_ / 8) * Max(x, 1) * Max(y, 1) * Max(z, 1);
+            for (unsigned level = ddsd.dwMipMapCount_; level > 1; x /= 2, y /= 2, z /= 2, --level)
+                dataSize += (ddsd.ddpfPixelFormat_.dwRGBBitCount_ / 8) * Max(x, 1U) * Max(y, 1U) * Max(z, 1U);
         }
 
         // Do not use a shared ptr here, in case nothing is refcounting the image outside this function.
@@ -428,23 +429,24 @@ bool Image::BeginLoad(Deserializer& source)
         {
             URHO3D_PROFILE(ConvertDDSToRGBA);
 
-            SharedPtr<Image> currentImage(this);
-            while (currentImage.NotNull())
+            currentImage = this;
+
+            while (currentImage)
             {
                 unsigned sourcePixelByteSize = ddsd.ddpfPixelFormat_.dwRGBBitCount_ >> 3;
                 unsigned numPixels = dataSize / sourcePixelByteSize;
 
 #define ADJUSTSHIFT(mask, l, r) \
                 if (mask && mask >= 0x100) \
-                                { \
-                                                    while ((mask >> r) >= 0x100) \
-                        ++r; \
-                                } \
-                        else if (mask && mask < 0x80) \
-                                { \
-                                                    while ((mask << l) < 0x80) \
-                        ++l; \
-                                }
+                { \
+                    while ((mask >> r) >= 0x100) \
+                    ++r; \
+                } \
+                else if (mask && mask < 0x80) \
+                { \
+                    while ((mask << l) < 0x80) \
+                    ++l; \
+                }
 
                 unsigned rShiftL = 0, gShiftL = 0, bShiftL = 0, aShiftL = 0;
                 unsigned rShiftR = 0, gShiftR = 0, bShiftR = 0, aShiftR = 0;
@@ -458,7 +460,6 @@ bool Image::BeginLoad(Deserializer& source)
                 ADJUSTSHIFT(aMask, aShiftL, aShiftR)
                 
                 SharedArrayPtr<unsigned char> rgbaData(new unsigned char[numPixels * 4]);
-                SetMemoryUse(numPixels * 4);
 
                 switch (sourcePixelByteSize)
                 {
@@ -514,6 +515,7 @@ bool Image::BeginLoad(Deserializer& source)
 
                 // Replace with converted data
                 currentImage->data_ = rgbaData;
+                currentImage->SetMemoryUse(numPixels * 4);
                 currentImage = currentImage->GetNextSibling();
             }
         }
@@ -1114,9 +1116,20 @@ void Image::ClearInt(unsigned uintColor)
         return;
     }
 
-    unsigned char* src = (unsigned char*)&uintColor;
-    for (unsigned i = 0; i < width_ * height_ * depth_ * components_; ++i)
-        data_[i] = src[i % components_];
+    if (components_ == 4)
+    {
+        unsigned color = uintColor;
+        unsigned* data = (unsigned*)GetData();
+        unsigned* data_end = (unsigned*)(GetData() + width_ * height_ * depth_ * components_);
+        for (; data < data_end; ++data)
+            *data = color;
+    }
+    else
+    {
+        unsigned char* src = (unsigned char*)&uintColor;
+        for (unsigned i = 0; i < width_ * height_ * depth_ * components_; ++i)
+            data_[i] = src[i % components_];
+    }
 }
 
 bool Image::SaveBMP(const String& fileName) const
@@ -1146,21 +1159,9 @@ bool Image::SavePNG(const String& fileName) const
 {
     URHO3D_PROFILE(SaveImagePNG);
 
-    FileSystem* fileSystem = GetSubsystem<FileSystem>();
-    if (fileSystem && !fileSystem->CheckAccess(GetPath(fileName)))
-    {
-        URHO3D_LOGERROR("Access denied to " + fileName);
-        return false;
-    }
-
-    if (IsCompressed())
-    {
-        URHO3D_LOGERROR("Can not save compressed image to PNG");
-        return false;
-    }
-
-    if (data_)
-        return stbi_write_png(GetNativePath(fileName).CString(), width_, height_, components_, data_.Get(), 0) != 0;
+    File outFile(context_, fileName, FILE_WRITE);
+    if (outFile.IsOpen())
+        return Image::Save(outFile); // Save uses PNG format
     else
         return false;
 }
@@ -2044,5 +2045,5 @@ void Image::FreeImageData(unsigned char* pixelData)
 
     stbi_image_free(pixelData);
 }
-
+ 
 }
